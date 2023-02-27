@@ -1,0 +1,127 @@
+#!/bin/bash
+
+file_list=$1
+shift
+
+sat_level=7000.
+low_level=2000.
+nfmin=6
+filter=w
+bin=1
+rebin=2
+
+flat_archive_dir=${REDUX_BASE_DIR}/flat_bank
+cleanup=yes
+
+while [ $# -gt 0 ] ; do eval $1 ; shift ; done
+
+[ -f $file_list ] || { echo "No file $file_list" ; exit 1 ; }
+
+go_iter=0
+function gonogo() {
+    ((go_iter++))
+    [ "$((go_iter%NBATCH))" -eq 0 ] && wait
+}
+
+dte=`date -u +20%y%m%d_%H%M%S`
+file0=`head -1 $file_list`
+day=`basename $file0 | cut -c1-8`
+cam=`gethead CCD_NAME $file0`
+[ "$cam" ] || cam=`basename $file0 | cut -c16-17`
+biasfile=bias_${cam}.fits
+darkfile=dark_${cam}.fits
+dte1=`basename $file0 | sed -e 's/f//g' -e 's/C/ /g' | awk '{print $1}'`
+tag=${dte1}_${cam}_${filter}_${rebin}
+me=`basename $0`
+here=`pwd`
+workdir=${here}/${me}_${dte}_$$
+[ -d $workdir ] || mkdir $workdir
+
+echo "Working in directory $workdir, logging to ${workdir}/${me}_${dte}_$$.log"
+exec > ${workdir}/${me}_${dte}_$$.log 2>&1
+
+gethead -p FILTER BINNING @$file_list | awk '{if($2~/'$filter'/ && $3=='$bin') print $1}' > ${workdir}/flist$$.txt
+
+nfiles=`cat ${workdir}/flist$$.txt | wc -l`
+
+if [ "$nfiles" -ge "$nfmin" ]; then
+    file0=`head -1 ${workdir}/flist$$.txt`
+    bsec=`gethead BIASSEC $file0`
+    dsec=`gethead DATASEC $file0`
+    for file in `cat ${workdir}/flist$$.txt`; do
+        med0=`immed "${file}${bsec}"`
+        med1=`immed "${file}${dsec}"`
+        echo $med0 $med1 $file | awk '{dm=$2-$1; if (dm<'$sat_level' && dm>'$low_level') print $3}'
+    done > ${workdir}/flist$$.tmp
+    mv ${workdir}/flist$$.tmp ${workdir}/flist$$.txt
+    nfiles=`cat ${workdir}/flist$$.txt | wc -l`
+fi
+
+if [ "$nfiles" -lt "$nfmin" ]; then
+    echo "Not enough files with filter=$filter and bin=$bin!"
+else
+
+    if [ -f "${workdir}/$biasfile" ]; then
+        echo "Using biasfile ${workdir}/$biasfile"
+    else
+        bias=`find_bias.sh $day $cam $rebin`
+        cd $workdir
+        echo funpack -O $biasfile $bias
+        funpack -O $biasfile $bias
+        cd $here
+    fi
+    if [ -f "${workdir}/$darkfile" ]; then
+        echo "Using darkfile ${workdir}/$darkfile"
+    else
+        dark=`find_dark.sh $day $cam $rebin`
+        cd $workdir
+        echo funpack -O $darkfile $dark
+        funpack -O $darkfile $dark
+        cd $here
+    fi
+
+    file0=`head -1 ${workdir}/flist$$.txt`
+    bsec=`gethead BIASSEC $file0`
+    dsec=`gethead DATASEC $file0`
+
+    function reduce_flat() {
+        local file=$1
+        local bfile=`basename $file`
+        local bfile0=${bfile%'.fz'}
+        local med0=`immed "${file}${bsec}"`
+        flatreduce ${file}${dsec} ${workdir}/$biasfile ${workdir}/$darkfile ${workdir}/$bfile0 $med0
+        local med1=`immed "${workdir}/$bfile0"`
+        local imed1=`echo $med1 | awk '{print 1/$1}'`
+        sethead SKYLEV=$med1 BSCALE=$imed1 ${workdir}/$bfile0
+        cphead FILTER BINNING $file ${workdir}/$bfile0
+    }
+
+    for file in `cat ${workdir}/flist$$.txt`; do
+        reduce_flat $file &
+        gonogo
+    done
+    wait
+
+    for file in `cat ${workdir}/flist$$.txt`; do
+        bfile=`basename $file`
+        bfile0=${bfile%'.fz'}
+        ls ${workdir}/$bfile0 | awk -F/ '{print $NF}'
+    done > ${workdir}/flist$$.tmp
+    cd $workdir
+    mv flist$$.tmp flist$$.txt
+
+    echo "Using $n files to build the flat..."
+    echo "# file                   sky_level  F Bin"
+    gethead SKYLEV FILTER BINNING @flist$$.txt
+
+    echo swarp @flist$$.txt -c ${SWARP_DIR}/ratir_redux.swarp -COMBINE_TYPE MEDIAN -IMAGEOUT_NAME flat_${tag}.fits -WEIGHTOUT_NAME expmapflat_${tag}.fits -WEIGHT_TYPE NONE -RESAMPLE N -SUBTRACT_BACK N
+    swarp @flist$$.txt -c ${SWARP_DIR}/ratir_redux.swarp -COMBINE_TYPE MEDIAN -IMAGEOUT_NAME flat_${tag}.fits -WEIGHTOUT_NAME expmapflat_${tag}.fits -WEIGHT_TYPE NONE -RESAMPLE N -SUBTRACT_BACK N 2>/dev/null
+
+    fpack flat_${tag}.fits
+    cp flat_${tag}.fits.fz $flat_archive_dir
+
+fi
+
+cp ${workdir}/${me}_${dte}_$$.log ${flat_archive_dir}/flat_${tag}.log
+
+[ "$cleanup" = "yes" ] &&  rm -r $workdir

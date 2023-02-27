@@ -1,0 +1,212 @@
+#!/bin/bash
+
+cmd="$0 $@"
+
+file_list=$1
+shift
+
+grb_RA=
+grb_DEC=
+filter=w
+
+#matching,wcs
+ps=0.000195 # platescale
+nstars_min=5
+mask_sigma=3.0
+bg_order=8
+
+# base reduction
+inst=coatli
+sat_level=7000.0
+gain=6.2
+detect_thresh=0.5
+
+do_nir_sky=yes
+
+do_dao=yes
+
+make_frame_jpegs=no
+
+cleanup=yes
+
+while [ $# -gt 0 ] ; do eval $1 ; shift ; done
+
+[ -s $file_list ] || { echo "No file $file_list" ; exit 1 ; }
+
+file0=`head -1 $file_list`
+[ -f $file0 ] || { echo "Cannot find first file $file0" ; exit 2 ; }
+
+# params above are for bin=2 and softgain=8, adjust accordingly
+sg=`gethead SOFTGAIN $file0`
+[ "$sg" ] && {
+    sat_level=`echo "$sat_level $sg" | awk '{printf("%.1f\n",$1*8/$2)}'`
+    gain=`echo "$gain $sg" | awk '{printf("%.1f\n",$1*$2/8.)}'`
+}
+bn=`gethead BINNING $file0`
+[ "$bn" ] && ps=`echo "$ps $bn" | awk '{printf("%.6f\n",$1*$2/2.)}'`
+
+go_iter=0
+function gonogo() {
+    ((go_iter++))
+    [ "$((go_iter%NBATCH))" -eq 0 ] && wait
+}
+
+cam=`basename $file0 | cut -c16-17`
+tag=${cam}_$filter
+
+dte=`date -u +20%y%m%d_%H%M%S`
+dte1=`basename $file0 | sed -e 's/f//g' -e 's/C/ /g' | awk '{print $1}'`
+me=`basename $0`
+here=`pwd`
+
+catdir=${here}/catalogs
+biasdir=${here}/biases
+darkdir=${here}/darks
+flatdir=${here}/flats
+workdir=${here}/${me}_$tag
+[ -d $catdir ] || mkdir $catdir
+[ -d $biasdir ] || mkdir $biasdir
+[ -d $darkdir ] || mkdir $darkdir
+[ -d $flatdir ] || mkdir $flatdir
+[ -d "$workdir" ] || mkdir $workdir
+
+nfiles=`cat $file_list | wc -l`
+logfile=${me}_${dte}_${tag}_$$.log
+rm ${workdir}/*log 2>/dev/null
+echo "Working in directory $workdir, logging to ${workdir}/$logfile"
+exec > ${workdir}/$logfile 2>&1
+
+date -u
+t00=`date +%s`
+echo $cmd
+
+# copy the data into the current directory
+bin=`gethead BINNING $file0`
+[ "$bin" ] || bin=1
+day=`basename $file0 | cut -c1-8`
+
+biasfile=bias_${cam}.fits
+if [ -f "${workdir}/$biasfile" ]; then
+    echo "Using biasfile ${workdir}/$biasfile"
+else
+    if [ -f ${biasdir}/$biasfile ]; then
+        echo "Using biasfile ${biasdir}/$biasfile"
+    else
+        bias=`find_bias.sh $day $cam $bin`
+        cd $biasdir
+        echo funpack -O $biasfile $bias
+        funpack -O $biasfile $bias
+        cd $here
+    fi
+    ln -s ${biasdir}/$biasfile $workdir
+fi
+darkfile=dark_${cam}.fits
+if [ -f "${workdir}/$darkfile" ]; then
+    echo "Using darkfile ${workdir}/$darkfile"
+else
+    if [ -f ${darkdir}/$darkfile ]; then
+        echo "Using darkfile ${darkdir}/$darkfile"
+    else
+        dark=`find_dark.sh $day $cam $bin`
+        cd $darkdir
+        echo funpack -O $darkfile $dark
+        funpack -O $darkfile $dark
+        cd $here
+    fi
+    ln -s ${darkdir}/$darkfile $workdir
+fi
+flatfile=flat_${tag}.fits
+if [ -f "${workdir}/$flatfile" ]; then
+    echo "Using flatfile ${workdir}/$flatfile"
+else
+    if [ -f ${flatdir}/$flatfile ]; then
+        echo "Using flatfile ${flatdir}/$flatfile"
+    else
+        flat=`find_flat.sh $day $cam $filter $bin`
+        cd $flatdir
+        echo funpack -O $flatfile $flat
+        funpack -O $flatfile $flat
+        cd $here
+    fi
+    ln -s ${flatdir}/$flatfile $workdir
+fi
+
+bsec=`gethead BIASSEC $file0`
+dsec=`gethead DATASEC $file0`
+nx=`echo $dsec | tr '[:,]' ' ' | awk '{printf("%.0f\n",$2-$1+1)}'`
+ny=`echo $dsec | tr '[:,]' ' ' | awk '{printf("%.0f\n",$4-$3+1)}'`
+cy=`echo $dsec | tr '[:,]' ' ' | awk '{printf("%.0f\n",($2-$1+1)/2)}'`
+cx=`echo $dsec | tr '[:,]' ' ' | awk '{printf("%.0f\n",($4-$3+1)/2)}'`
+
+function base_redux() {
+    local file=$1
+    local smt=`gethead SMTMRO $file | awk '{print int($1)}'`
+    local emt=`gethead EMTMRO $file | awk '{print int($1)}'`
+    if [ "$smt" = "$emt" ]; then
+        local bfile0=$2
+        local med0=`immed "${file}${bsec}"`
+        local sky=`immed "${file}${dsec}" | awk '{sky=$1-('$med0'); if(sky<1) sky=1.; printf("%.2f\n",sky)}'`
+        local exptime=`gethead EXPTIME $file`
+        local igain=`echo $gain $exptime | awk '{print $1*$2}'`
+        local skye=`echo $sky $exptime | awk '{printf("%.6f\n",$1/$2)}'`
+        local sat=`echo $sat_level $sky $exptime | awk '{printf("%.6f\n",($1-$2)/$3)}'`
+        local smt=`gethead SMTMRO $file | awk '{print int($1)}'`
+        local emt=`gethead EMTMRO $file | awk '{print int($1)}'`
+        echo imreduce "${file}${dsec}" $workdir/$biasfile $workdir/$darkfile $workdir/$flatfile $bfile0 ${bfile0%'.fits'}.wt.fits $sky $med0 $smt
+        imreduce "${file}${dsec}" $workdir/$biasfile $workdir/$darkfile $workdir/$flatfile $bfile0 ${bfile0%'.fits'}.wt.fits $sky $med0 $smt
+        local edte=`gethead EDATE $bfile0`
+        sethead DATE-OBE=$edte CTYPE1='RA---TAN' CTYPE2='DEC--TAN' CD1_1=-$ps CD2_2=$ps CD2_1=0.0 CD1_2=0.0 CRPIX1=$cx CRPIX2=$cy CRVAL1=30.0 CRVAL2=0.0 SKYLEV=$skye SATURATE=$sat GAIN=$igain $bfile0
+    else
+        echo "skipping file $file , (SMTRO/EMTRO=${smt}/${emt})"
+    fi
+}
+
+rm ${workdir}/old_$file_list ${workdir}/new_$file_list 2>/dev/null
+for file in `cat $file_list`; do
+    bfile=`basename $file`
+    bfile0=${workdir}/${bfile%'.fz'}
+    [ -f $bfile0 ] || {
+        filter0=`gethead FILTER $file`
+        [ "$filter0" = "$filter" ] && {
+            base_redux $file $bfile0 &
+            gonogo
+        }
+    }
+done
+wait; go_iter=0
+for file in `cat $file_list`; do
+    bfile=`basename $file`
+    bfile0=${bfile%'.fz'}
+    ls ${workdir}/$bfile0 2>/dev/null | awk -F/ '{print $NF}'
+done > ${workdir}/$file_list
+cd $workdir
+
+# the images have been reduced, now we need to find stars and align
+gethead -a -u NSTARS MATCHED NAXIS1 @$file_list | eval awk "'{if(\$2~/___/) print \$1>\"new_$file_list\"; else if (\$3!~/___/) print \$1>\"old_$file_list\"}'"
+
+# replace new_$file list with files that contain stars and are aligned
+if [ -s new_$file_list ]; then
+    echo align_coatli.sh new_$file_list nstars_min=$nstars_min inst=$inst
+    align_coatli.sh new_$file_list nstars_min=$nstars_min inst=$inst
+fi
+
+# now we stack all the aligned files
+cat new_$file_list old_$file_list 2>/dev/null > both_$file_list
+nstack=`cat both_$file_list | wc -l`
+
+if [ "$nstack" -gt 0 ]; then
+    echo stack_coatli.sh both_$file_list mask_sigma=$mask_sigma bg_order=$bg_order do_nir_sky=$do_nir_sky inst=$inst gain=$gain ps=$ps
+    stack_coatli.sh both_$file_list mask_sigma=$mask_sigma bg_order=$bg_order do_nir_sky=$do_nir_sky inst=$inst gain=$gain ps=$ps
+fi
+
+if [ -f stack_${cam}.fits ]; then
+    echo coatli_phot.sh fboth_$file_list catdir=$catdir detect_thresh=$detect_thresh do_dao=$do_dao
+    coatli_phot.sh fboth_$file_list catdir=$catdir detect_thresh=$detect_thresh do_dao=$do_dao
+    echo coatli_summary.sh fboth_$file_list savedir=$here make_frame_jpegs=$make_frame_jpegs logfile=$logfile
+    coatli_summary.sh fboth_$file_list savedir=$here make_frame_jpegs=$make_frame_jpegs logfile=$logfile
+fi
+
+if [ "$cleanup" = "yes" ]; then
+    echo "Cleaning up, removing $workdir and $catdir"
+    rm -r $workdir $catdir
+fi

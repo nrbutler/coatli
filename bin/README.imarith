@@ -1,0 +1,1 @@
+gcc -o imarith imarith.c -L. -lcfitsio -lm
