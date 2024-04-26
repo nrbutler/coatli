@@ -9,7 +9,10 @@ from numpy import loadtxt,sqrt,median,log10,where,ones,zeros
 import matplotlib as mpl
 mpl.use('Agg')
 
-from matplotlib.pyplot import plot,xlabel,ylabel,savefig,ylim,xlim,errorbar,clf,title,legend,annotate,semilogx
+from matplotlib.pyplot import plot,xlabel,ylabel,savefig,ylim,xlim,errorbar,clf,title,legend,annotate,semilogx,subplots,ioff,close
+ioff()
+
+from multiprocessing import Pool,Lock
 
 from linfit import linfit
 
@@ -17,6 +20,12 @@ def usage():
     print (__doc__)
     sys.exit()
 
+def init(lock0):
+    """
+    to avoid drawing more than one lc plot at once
+    """
+    global lock
+    lock = lock0
 
 def get_non_overlapping(image_id,parent_id,nchildren):
     """
@@ -48,6 +57,52 @@ def get_non_overlapping(image_id,parent_id,nchildren):
     non_overlapping[bad_parent] = False
 
     return non_overlapping
+
+
+def make_lc_plot(lc_file):
+    """
+      make an lc jpg from an lc txt file
+    """
+
+    n,t,dt,m,dm,olap = loadtxt(lc_file,unpack=True)
+    j0 = olap>0
+
+    j=dm<999
+    j1=j*j0
+    if (j1.sum()<2): return 0
+    j2=(~j)*j0
+    dm[j2] = 0.5; m[j2] += 0.5
+
+    fig,ax = subplots()
+    ax.errorbar(t[j0],m[j0],xerr=dt[j0]/2.,yerr=dm[j0],marker='o',capsize=0,linestyle='None',markersize=3,mew=1)
+    ax.set_ylim((m[j0].max()+0.5,m[j0].min()-0.5))
+    ax.plot (t[j2],m[j2]+0.5,'bv')
+    ax.plot (t[j2],m[j2]-0.5,'bo')
+
+    f = open(lc_file)
+    dat = f.readlines()
+    f.close()
+
+    slp,dslp,chi2,res0 = dat[4].split()[3:]
+    slp,dslp,res0 = float(slp),float(dslp),float(res0)
+
+    ii = t[j1].argsort()    
+    x=-2.5*log10(t)
+    xm = x[j1].mean(); ym = m[j1].mean()
+    ax.plot (t[j1][ii],res0+slp*(x[j1][ii]-xm)+ym,label="""%.4f +/- %.4f""" % (slp,dslp))
+    ax.legend()
+
+    x1,x2 = dat[0].split()[2:]
+    ax.set_xlim((float(x1),float(x2)))
+    ax.set_xlabel(dat[1].strip()[2:],fontsize=16)
+    ax.set_ylabel(dat[2].strip()[2:],fontsize=16)
+    ax.set_title(dat[3].strip()[2:])
+
+    #lock.acquire()
+    fig.savefig(lc_file.replace('.txt','.jpg'))
+    #lock.release()
+
+    close(fig)
 
 
 def lc_plots_coatli(photfile,outfile,cfilter='USNO-R(AB)'):
@@ -92,6 +147,8 @@ def lc_plots_coatli(photfile,outfile,cfilter='USNO-R(AB)'):
     ofile=open(outfile,'w')
     ofile.write("#  id     slope      dslope       chi2/nu\n")
 
+    lc_files = []
+
     for i in range(m0):
         j = data[:,i,3]>0
         if (j.sum()<=1): continue
@@ -112,12 +169,6 @@ def lc_plots_coatli(photfile,outfile,cfilter='USNO-R(AB)'):
         if (j1.sum()<2): continue
         j2=(~j)*j0
         dm[j2] = 0.5; m[j2] += 0.5
-
-        clf()
-        errorbar(t[j0],m[j0],xerr=dt[j0]/2.,yerr=dm[j0],marker='o',capsize=0,linestyle='None',markersize=3,mew=1)
-        ylim((m[j0].max()+0.5,m[j0].min()-0.5))
-        plot (t[j2],m[j2]+0.5,'bv')
-        plot (t[j2],m[j2]-0.5,'bo')
 
         x=-2.5*log10(t)
         res = linfit(x[j1],m[j1],dy=dm[j1],slope_prior_err=1.)
@@ -144,30 +195,36 @@ def lc_plots_coatli(photfile,outfile,cfilter='USNO-R(AB)'):
             slp /= 1.+dslp**2*chi2
             dslp /= 1.+dslp**2*chi2
 
-        ofile.write("""%5d %10.4f %10.4f %10.2f\n""" % (id0,slp,dslp,chi2))
-
-        ii = t[j1].argsort()
-        plot (t[j1][ii],res[0]+slp*(x[j1][ii]-xm)+ym,label="""%.4f +/- %.4f""" % (slp,dslp))
-        legend()
+        ofile.write("""%5d %10.4f %10.4f %10.2f %10.4e\n""" % (id0,slp,dslp,chi2,res[0]))
 
         d0 = expos.min()
-        xlim((gps.min()-d0,gps.max()+d0))
-        xlabel("""Time Since %s - %.2f [hours]""" % (t0,gps0/3600.),fontsize=16)
-        ylabel(cfilter,fontsize=16)
-        title("""Light Curve for Source %d (RA=%.6f, Dec=%.6f, Mag=%.1f)""" % (id0,ra0,dec0,mag0))
-        savefig("""lc_%d.jpg""" % id0)
+        xlim_use = """# xlim %f %f\n""" % (gps.min()-d0,gps.max()+d0)
+        xlabel_use = """# Time Since %s - %.2f [hours]\n""" % (t0,gps0/3600.)
+        ylabel_use = '# '+cfilter+'\n'
+        title_use = """# Light Curve for Source %d (RA=%.6f, Dec=%.6f, Mag=%.1f)\n""" % (id0,ra0,dec0,mag0)
 
-        of = open("""lc_%d.txt""" % id0,'w')
+        lc_file = """lc_%d.txt""" % id0
+        of = open(lc_file,'w')
+        of.write(xlim_use)
+        of.write(xlabel_use)
+        of.write(ylabel_use)
+        of.write(title_use)
+        of.write("""# fitting %5d %10.4f %10.4f %10.2f %10.4e\n""" % (id0,slp,dslp,chi2,res[0]))
         of.write("""# imid time1 time2 exposure mag dmag non_overlapping?\n""")
-        of.write("""0 %s %s %.1f %.4f %.4f 0\n""" % (t10,t20,dt0,mag0,dmag0))
+        of.write("""# overall: 0 %s %s %.1f %.4f %.4f 0\n""" % (t10,t20,dt0,mag0,dmag0))
         for ii in range(len(n)):
-            of.write("""%d %s %s %.1f %.4f %.4f %d\n""" % (n[ii],t1[ii],t2[ii],exptime[ii],m[ii],dm[ii],int(non_overlapping[ii])))
+            of.write("""%d %.8f %.8f %.4f %.4f %d\n""" % (n[ii],t[ii],dt[ii],m[ii],dm[ii],int(non_overlapping[ii])))
 
         of.close()
+        lc_files.append(lc_file)
 
     ofile.close()
 
-    i,s,ds,c2=loadtxt(outfile,unpack=True,ndmin=2)
+    lock0 = Lock()
+    pool = Pool(initializer=init, initargs=(lock0,))
+    pool.map( make_lc_plot, lc_files )
+
+    i,s,ds,c2,norm=loadtxt(outfile,unpack=True,ndmin=2)
     j=c2>0
     if (j.sum()>0):
         i,s,ds,c2 = i[j],s[j],ds[j],c2[j]
